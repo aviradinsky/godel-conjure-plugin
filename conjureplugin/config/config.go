@@ -12,132 +12,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package config
+package cmd
 
 import (
-	"io/ioutil"
-	"net/url"
 	"os"
-	"sort"
-	"strings"
 
+	"github.com/palantir/distgo/distgo"
 	"github.com/palantir/godel-conjure-plugin/v6/conjureplugin"
-	v1 "github.com/palantir/godel-conjure-plugin/v6/conjureplugin/config/internal/v1"
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	"github.com/spf13/cobra"
 )
 
-type ConjurePluginConfig v1.ConjurePluginConfig
+var (
+	dryRunFlagVal bool
+)
 
-func ToConjurePluginConfig(in *ConjurePluginConfig) *v1.ConjurePluginConfig {
-	return (*v1.ConjurePluginConfig)(in)
-}
-
-func (c *ConjurePluginConfig) ToParams() (conjureplugin.ConjureProjectParams, error) {
-	var keys []string
-	for k := range c.ProjectConfigs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	params := make(map[string]conjureplugin.ConjureProjectParam)
-	for key, currConfig := range c.ProjectConfigs {
-		irProvider, err := (*IRLocatorConfig)(&currConfig.IRLocator).ToIRProvider()
+var publishCmd = &cobra.Command{
+	Use:   "publish",
+	Short: "Publish Conjure IR",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		projectParams, err := toProjectParams(configFileFlag)
 		if err != nil {
-			return conjureplugin.ConjureProjectParams{}, errors.Wrapf(err, "failed to convert configuration for %s to provider", key)
+			return err
+		}
+		if err := os.Chdir(projectDirFlag); err != nil {
+			return errors.Wrapf(err, "failed to set working directory")
 		}
 
-		publishVal := false
-		// if value for "publish" is not specified, treat as "true" only if provider generates IR from YAML
-		if currConfig.Publish == nil {
-			publishVal = irProvider.GeneratedFromYAML()
+		publisherFlags, err := conjureplugin.PublisherFlags()
+		if err != nil {
+			return err
 		}
-		acceptFuncsFlag := true
-		if currConfig.AcceptFuncs != nil {
-			acceptFuncsFlag = *currConfig.AcceptFuncs
-		}
-		params[key] = conjureplugin.ConjureProjectParam{
-			OutputDir:   currConfig.OutputDir,
-			IRProvider:  irProvider,
-			AcceptFuncs: acceptFuncsFlag,
-			Server:      currConfig.Server,
-			CLI:         currConfig.CLI,
-			Publish:     publishVal,
-		}
-	}
-	return conjureplugin.ConjureProjectParams{
-		SortedKeys: keys,
-		Params:     params,
-	}, nil
-}
 
-type SingleConjureConfig v1.SingleConjureConfig
-
-func ToSingleConjureConfig(in *SingleConjureConfig) *v1.SingleConjureConfig {
-	return (*v1.SingleConjureConfig)(in)
-}
-
-type LocatorType v1.LocatorType
-
-type IRLocatorConfig v1.IRLocatorConfig
-
-func ToIRLocatorConfig(in *IRLocatorConfig) *v1.IRLocatorConfig {
-	return (*v1.IRLocatorConfig)(in)
-}
-
-func (cfg *IRLocatorConfig) ToIRProvider() (conjureplugin.IRProvider, error) {
-	if cfg.Locator == "" {
-		return nil, errors.Errorf("locator cannot be empty")
-	}
-
-	locatorType := cfg.Type
-	if locatorType == "" || locatorType == v1.LocatorTypeAuto {
-		if parsedURL, err := url.Parse(cfg.Locator); err == nil && parsedURL.Scheme != "" {
-			// if locator can be parsed as a URL and it has a scheme explicitly specified, assume it is remote
-			locatorType = v1.LocatorTypeRemote
-		} else {
-			// treat as local: determine if path should be used as file or directory
-			switch lowercaseLocator := strings.ToLower(cfg.Locator); {
-			case strings.HasSuffix(lowercaseLocator, ".yml") || strings.HasSuffix(lowercaseLocator, ".yaml"):
-				locatorType = v1.LocatorTypeYAML
-			case strings.HasSuffix(lowercaseLocator, ".json"):
-				locatorType = v1.LocatorTypeIRFile
-			default:
-				// assume path is to local YAML directory
-				locatorType = v1.LocatorTypeYAML
-
-				// if path exists and is a file, treat path as an IR file
-				if fi, err := os.Stat(cfg.Locator); err == nil && !fi.IsDir() {
-					locatorType = v1.LocatorTypeIRFile
-				}
+		flagVals := make(map[distgo.PublisherFlagName]interface{})
+		for _, currFlag := range publisherFlags {
+			// if flag was not explicitly provided, don't add it to the flagVals map
+			if !cmd.Flags().Changed(string(currFlag.Name)) {
+				continue
 			}
+			val, err := currFlag.GetFlagValue(cmd.Flags())
+			if err != nil {
+				return err
+			}
+			flagVals[currFlag.Name] = val
 		}
-	}
-
-	switch locatorType {
-	case v1.LocatorTypeRemote:
-		return conjureplugin.NewHTTPIRProvider(cfg.Locator), nil
-	case v1.LocatorTypeYAML:
-		return conjureplugin.NewLocalYAMLIRProvider(cfg.Locator), nil
-	case v1.LocatorTypeIRFile:
-		return conjureplugin.NewLocalFileIRProvider(cfg.Locator), nil
-	default:
-		return nil, errors.Errorf("unknown locator type: %s", locatorType)
-	}
+		return conjureplugin.Publish(projectParams, projectDirFlag, flagVals, dryRunFlagVal, cmd.OutOrStdout())
+	},
 }
 
-func ReadConfigFromFile(f string) (ConjurePluginConfig, error) {
-	bytes, err := ioutil.ReadFile(f)
-	if err != nil {
-		return ConjurePluginConfig{}, errors.WithStack(err)
-	}
-	return ReadConfigFromBytes(bytes)
-}
+func init() {
+	publishCmd.Flags().BoolVar(&dryRunFlagVal, "dry-run", false, "print the operations that would be performed")
 
-func ReadConfigFromBytes(inputBytes []byte) (ConjurePluginConfig, error) {
-	var cfg ConjurePluginConfig
-	if err := yaml.UnmarshalStrict(inputBytes, &cfg); err != nil {
-		return ConjurePluginConfig{}, errors.WithStack(err)
-	}
-	return cfg, nil
+	rootCmd.AddCommand(publishCmd)
 }
